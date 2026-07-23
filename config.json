@@ -1,3 +1,6 @@
 {
-    "download_path":""
+    "download_path": "",
+    "search_urls": [
+        "https://annas-archive.gl"
+    ]
 }

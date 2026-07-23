@@ -1,420 +1,354 @@
 #! /usr/bin/env python3
-import time
-import os
-import logging
-import sys
 import argparse
 import json
+import logging
+import os
+import re
+import shutil
+import sys
+import subprocess
+import time
 from pathlib import Path
+from urllib.parse import quote
 
 from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
 from selenium.common.exceptions import NoSuchElementException
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.common.by import By
 from webdriver_manager.chrome import ChromeDriverManager
 
-# Default download path -> ./assets/{book}
 C_DIR = os.path.dirname(os.path.realpath(__file__))
-DL_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'assets')
+DL_PATH = os.path.join(C_DIR, "assets")
+SEARCH_URLS = ["https://annas-archive.gl"]
 
-if Path(f'{C_DIR}/config.json').is_file():
-    # Read config file to determine if path is set
-    with open(f'{C_DIR}/config.json', 'r') as f:
-        config = json.load(f)
-         
-        if config['download_path'] and config['download_path'] != '':
-             DL_PATH = config['download_path'].strip()
+config_path = Path(C_DIR) / "config.json"
+if config_path.is_file():
+    with config_path.open() as config_file:
+        config = json.load(config_file)
 
-# Detect download status & time
+    download_path = config.get("download_path", "")
+    if download_path:
+        DL_PATH = download_path.strip()
+
+    configured_urls = config.get("search_urls", SEARCH_URLS)
+    if isinstance(configured_urls, list):
+        SEARCH_URLS = [str(url).strip().rstrip("/")
+                       for url in configured_urls if str(url).strip()]
+    elif isinstance(configured_urls, str) and configured_urls.strip():
+        SEARCH_URLS = [configured_urls.strip().rstrip("/")]
+
+if not SEARCH_URLS:
+    raise SystemExit("config.json must contain at least one search URL")
+
+
 def dlwait(path):
-    ''' Wait until the file download is completed. Will not work if a corrupted download is already 
-    in the given path. If the function starts before the download, it won't wait for its completion.'''
+    """Wait until Chromium finishes downloading a file."""
     start_time = time.time()
-    dl_wait = True
-    
-    while dl_wait:
-        time.sleep(1) # Precision
-        dl_wait = False
-         
-        for book in os.listdir(path):
-            if book.endswith('.crdownload'):
-                dl_wait = True
-     
-    runtime = "%s" % round(time.time() - start_time, 4)
-    return runtime
+    while any(name.endswith(".crdownload") for name in os.listdir(path)):
+        time.sleep(1)
+    return str(round(time.time() - start_time, 4))
 
-# Argparse initialization & parameters
-parser = argparse.ArgumentParser()
 
-parser.add_argument('path', metavar='path', type=str, default=DL_PATH, action='store',
-                    nargs='?', help='A path for the download')
+def chrome_options(binary=None):
+    options = Options()
+    if binary:
+        options.binary_location = binary
+    options.add_argument("--headless")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-logging")
+    options.add_argument("--log-level=3")
+    options.add_argument("--silent")
+    options.add_argument("--no-first-run")
+    options.add_argument("--no-default-browser-check")
+    options.add_argument("--remote-debugging-pipe")
+    options.add_experimental_option("excludeSwitches", ["enable-logging"])
+    options.add_experimental_option("useAutomationExtension", False)
+    return options
 
-parser.add_argument('--s', metavar='search', type=str, action='store',
-                    required=True, help='A search query for the download')
 
-parser.add_argument('--n', metavar='quantity', type=int, default=5, 
-                    help='Number of search results desired')
+def browser_version(binary):
+    result = subprocess.run(
+        [binary, "--version"], capture_output=True, text=True,
+        timeout=5, check=True,
+    )
+    match = re.search(r"\b(\d+\.\d+\.\d+\.\d+)\b", result.stdout)
+    if not match:
+        raise RuntimeError(f"could not determine version from {result.stdout!r}")
+    return match.group(1)
 
-args = parser.parse_args()
 
-# Disable unsightly webdriver-manager log messages
-os.environ['WDM_LOG_LEVEL'] = '0'
-os.environ['WDM_LOG'] = str(logging.NOTSET)
-logging.getLogger('WDM').setLevel(logging.NOTSET)
+def start_browser():
+    """Try each installed browser with a driver matching its exact version."""
+    browser_names = (
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+    )
+    browsers = []
+    for name in browser_names:
+        binary = shutil.which(name)
+        if binary and binary not in browsers:
+            browsers.append(binary)
 
-chrome_options = Options()
+    # Windows installations are commonly not added to PATH.
+    windows_roots = (
+        os.environ.get("PROGRAMFILES"),
+        os.environ.get("PROGRAMFILES(X86)"),
+        os.environ.get("LOCALAPPDATA"),
+    )
+    windows_paths = (
+        "Google/Chrome/Application/chrome.exe",
+        "Chromium/Application/chrome.exe",
+        "Chromium/chrome.exe",
+    )
+    for root in windows_roots:
+        if not root:
+            continue
+        for relative_path in windows_paths:
+            binary = os.path.join(root, relative_path)
+            if os.path.isfile(binary) and binary not in browsers:
+                browsers.append(binary)
 
-# Include this to remove GUI and extensions for the sake of simplicity
-chrome_options.add_argument("--headless")
-chrome_options.add_argument("--disable-extensions")
-chrome_options.add_argument("--no-sandbox")
-chrome_options.add_argument("--disable-dev-shm-usage")
-chrome_options.add_argument("--disable-logging")
-chrome_options.add_argument("--log-level=3")
-chrome_options.add_argument("--silent")
-chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
-chrome_options.add_experimental_option('useAutomationExtension', False)
+    errors = []
+    os.environ["WDM_LOG_LEVEL"] = "0"
+    os.environ["WDM_LOG"] = str(logging.NOTSET)
+    os.environ.setdefault("WDM_LOCAL", "1")
 
-# Try to get chromedriver path and find the actual executable
-try:
-    # Get the chromedriver path
-    driver_path = ChromeDriverManager().install()
-    
-    # Fix for the incorrect path issue - find the actual chromedriver executable
-    if 'THIRD_PARTY_NOTICES' in driver_path or not driver_path.endswith('chromedriver'):
-        # Get the directory containing the chromedriver
-        driver_dir = os.path.dirname(driver_path)
-        
-        # Look for the actual chromedriver executable
-        for file in os.listdir(driver_dir):
-            if file == 'chromedriver' or (file.startswith('chromedriver') and not file.endswith('.txt')):
-                actual_driver_path = os.path.join(driver_dir, file)
-                # Make sure it's executable
-                os.chmod(actual_driver_path, 0o755)
-                driver_path = actual_driver_path
-                break
-        
-        # If we still can't find it, look one level up (sometimes it's in a subdirectory)
-        if 'THIRD_PARTY_NOTICES' in driver_path:
-            parent_dir = os.path.dirname(driver_dir)
-            for root, dirs, files in os.walk(parent_dir):
-                for file in files:
-                    if file == 'chromedriver':
-                        actual_driver_path = os.path.join(root, file)
-                        os.chmod(actual_driver_path, 0o755)
-                        driver_path = actual_driver_path
-                        break
-                if file == 'chromedriver':
-                    break
-    
-    driver = webdriver.Chrome(service=ChromeService(driver_path), options=chrome_options)
-    
-except Exception as e:
-    print(f"Error with ChromeDriverManager: {e}")
-    print("Trying alternative approach...")
-    
-    # Use system chromedriver if available
-    try:
-        # Try to use system chromedriver (if installed via homebrew or manually)
-        driver = webdriver.Chrome(options=chrome_options)
-    except Exception as e2:
-        print(f"System chromedriver also failed: {e2}")
-        print("\nPlease try one of these solutions:")
-        print("1. Install chromedriver manually:")
-        print("   brew install chromedriver (on macOS)")
-        print("   or download from https://chromedriver.chromium.org/")
-        print("2. Clear the webdriver cache:")
-        print("   rm -rf ~/.wdm/")
-        print("3. Update your Chrome browser to the latest version")
-        sys.exit(1)
+    for binary in browsers:
+        service = None
+        try:
+            version = browser_version(binary)
+            driver_path = ChromeDriverManager(driver_version=version).install()
+            service = ChromeService(driver_path)
+            return webdriver.Chrome(
+                service=service, options=chrome_options(binary)
+            )
+        except Exception as error:
+            if service:
+                service.stop()
+            errors.append(f"{binary}: {error}")
 
-DL_PATH = args.path
-search = args.s
-result_count = args.n
+    # Last resort: let Selenium Manager choose a driver if the exact-version
+    # download is unavailable. This is intentionally after the exact matches
+    # so a stale cached driver cannot be selected first.
+    for binary in browsers:
+        try:
+            return webdriver.Chrome(options=chrome_options(binary))
+        except Exception as error:
+            errors.append(f"Selenium Manager/{binary}: {error}")
 
-# Ensure download directory exists
-os.makedirs(DL_PATH, exist_ok=True)
-
-# Enable downloads in selenium
-driver.command_executor._commands["send_command"] = ("POST", '/session/$sessionId/chromium/send_command')
-
-params = {'cmd': 'Page.setDownloadBehavior', 'params': {'behavior': 'allow', 'downloadPath': DL_PATH}}
-command_result = driver.execute("send_command", params)
-
-# Array containing search results
-sresults = []
-
-# Search query and begin download
-start_url = f"https://annas-archive.org/search?q={search}"
-driver.get(start_url)
-
-# Wait for page to load
-time.sleep(2)
-
-# scroll to the bottom of the page so that every element I search for is returned.
-driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-
-# Wait a bit more for dynamic content
-time.sleep(1)
-
-# Find book links using the correct selector from the HTML structure
-book_links = driver.find_elements(By.CSS_SELECTOR, 'a.js-vim-focus.custom-a')
-
-print(f"Found {len(book_links)} book links")
-
-# Check if we have enough results
-if len(book_links) < result_count:
-    result_count = len(book_links)
-    print(f"Only {result_count} results found")
-
-if result_count == 0:
-    print("No results found. Please check your search query.")
-    driver.quit()
+    print("Could not start Chrome or Chromium.")
+    for error in errors:
+        print(f"  {error}")
+    print("Install Chrome or Chromium and rerun the command.")
     sys.exit(1)
 
-# add links to the array of search results
-for n in range(result_count):
-    href = str(book_links[n].get_attribute('href'))
-    sresults.append(href)
 
-# Loop through the book links and extract information directly
-for i in range(result_count):
-    try:
-        # Get the book link element
-        book_link = book_links[i]
-        
-        # Extract title directly from the link text
-        title = book_link.text.strip()
-        
-        # Find the parent container for this book
-        # Navigate up to find the main container
-        container = book_link
-        try:
-            for _ in range(5):  # Try up to 5 parent levels
-                container = container.find_element(By.XPATH, "..")
-                classes = container.get_attribute('class') or ""
-                if 'flex' in classes and ('pt-3' in classes or 'border-b' in classes):
-                    break
-        except:
-            # If we can't find the container, use the book_link's immediate parent
-            container = book_link.find_element(By.XPATH, "../..")
-        
-        print(f"\n[{i+1}] {title}")
-        
-        # Extract all text from the container for debugging
-        all_text = container.text
-        
-        # Extract author - look for any link that contains author info
-        author = "Unknown"
-        try:
-            # Look for links in the container that might be author links
-            all_links = container.find_elements(By.TAG_NAME, 'a')
-            for link in all_links:
-                href = link.get_attribute('href') or ""
-                text = link.text.strip()
-                # Skip the main title link and empty links
-                if href and 'search?q=' in href and text and text != title:
-                    # Check if this looks like an author (usually appears after title)
-                    if len(text.split(',')) <= 2 and len(text.split()) <= 4:  # Author names are usually short
-                        author = text
-                        break
-        except Exception as e:
-            print(f"\t  Error extracting author: {e}")
-        
-        print(f"\tAuthor: {author}")
-        
-        # Extract year/publisher from text
-        publisher = "Unknown"
-        try:
-            import re
-            # Look for 4-digit year
-            year_match = re.search(r'\b(19|20)\d{2}\b', all_text)
-            if year_match:
-                publisher = year_match.group(0)
-        except Exception as e:
-            print(f"\t  Error extracting year: {e}")
-            
-        print(f"\tYear: {publisher}")
+def md5_for_url(url):
+    match = re.search(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])",
+                      url, re.IGNORECASE)
+    return match.group(0).lower() if match else None
 
-        # Extract metadata from text
-        language = "Unknown"
-        file_format = "Unknown" 
-        file_size = "Unknown"
-        
+
+def search_results(driver, search, result_count, download_all):
+    grouped = {}
+    search_errors = []
+
+    for base_url in SEARCH_URLS:
         try:
-            import re
-            
-            # Extract language (pattern like "English [en]")
-            language_match = re.search(r'(\w+)\s+\[([a-z]{2})\]', all_text)
-            if language_match:
-                language = language_match.group(1)
-            
-            # Extract file format (like EPUB, PDF) - look for common formats
-            format_match = re.search(r'\b(EPUB|PDF|MOBI|AZW3|TXT|DOC|DOCX)\b', all_text, re.IGNORECASE)
-            if format_match:
-                file_format = format_match.group(1).upper()
-            
-            # Extract file size (like 0.3MB)
-            size_match = re.search(r'(\d+\.?\d*\s*[MKG]B)', all_text, re.IGNORECASE)
-            if size_match:
-                file_size = size_match.group(1)
-                
-        except Exception as e:
-            print(f"\t  Error extracting metadata: {e}")
+            start_url = f"{base_url}/search?q={quote(search)}"
+            driver.get(start_url)
+            time.sleep(2)
+            driver.execute_script(
+                "window.scrollTo(0, document.body.scrollHeight);"
+            )
+            time.sleep(1)
 
-        print(f"\tLanguage: {language}")
-        print(f"\tFormat: {file_format}, Size: {file_size}")
-        
-        # Debug: print some of the raw text if needed
-        if i == 0:  # Print debug info for first result
-            print(f"\t  Debug - Container text preview: {all_text[:200]}...")
-        
-    except Exception as e:
-        print(f"\n[{i+1}] Error extracting info for book {i+1}: {e}")
-        # Print at least the title if we can get it
+            links = driver.find_elements(
+                By.CSS_SELECTOR, "a.js-vim-focus.custom-a"
+            )
+            print(f"{base_url}: found {len(links)} book links")
+
+            for link in links:
+                href = str(link.get_attribute("href") or "")
+                if not href:
+                    continue
+                md5 = md5_for_url(href)
+                key = md5 or href
+                result = grouped.setdefault(
+                    key,
+                    {"md5": md5 or "unknown", "title": link.text.strip(),
+                     "urls": []},
+                )
+                if not result["title"]:
+                    result["title"] = link.text.strip()
+                if href not in result["urls"]:
+                    result["urls"].append(href)
+        except Exception as error:
+            search_errors.append((base_url, str(error)))
+            print(f"{base_url}: search failed: {error}")
+
+    results = list(grouped.values())
+    if download_all or result_count == 0:
+        selected_results = results
+    else:
+        selected_results = results[:result_count]
+        if len(results) < result_count:
+            print(f"Only {len(results)} unique results found")
+
+    if search_errors:
+        print("\nSearch sources that failed:")
+        for url, error in search_errors:
+            print(f"  {url}: {error}")
+
+    for index, result in enumerate(selected_results, start=1):
+        print(f"\n[{index}] {result['title']}")
+        print(f"\tMD5: {result['md5']}")
+        print(f"\tPossible download URLs: {len(result['urls'])}")
+
+    return selected_results
+
+
+def click_external_downloads(driver):
+    selectors = (
+        "//a[contains(text(), 'show external downloads')]",
+        "//a[contains(text(), 'external downloads')]",
+        "//button[contains(text(), 'show external downloads')]",
+    )
+    for selector in selectors:
         try:
-            title = book_links[i].text.strip()
-            print(f"\tTitle: {title}")
-        except:
-            print(f"\tCould not extract title")
-
-try:
-    book_selection = int(input("\nEnter desired download: "))
-    
-    if book_selection < 1 or book_selection > len(sresults):
-        print("Invalid selection")
-        driver.quit()
-        sys.exit(1)
-
-    driver.get(sresults[book_selection-1])
-    
-    # Wait for page to load
-    time.sleep(2)
-
-    # click "show external downloads" - try multiple possible selectors
-    try:
-        show_link = driver.find_element(By.XPATH, "//a[contains(text(), 'show external downloads')]")
-        show_link.click()
-    except NoSuchElementException:
-        try:
-            show_link = driver.find_element(By.XPATH, "//a[contains(text(), 'external downloads')]")
-            show_link.click()
+            driver.find_element(By.XPATH, selector).click()
+            return
         except NoSuchElementException:
-            try:
-                show_link = driver.find_element(By.XPATH, "//button[contains(text(), 'show external downloads')]")
-                show_link.click()
-            except NoSuchElementException:
-                print("Could not find 'show external downloads' link. Looking for direct download links...")
+            continue
 
-    # Wait for external downloads to load
+
+def download_from_source(driver, source_url, download_path):
+    driver.get(source_url)
+    time.sleep(2)
+    click_external_downloads(driver)
     time.sleep(2)
 
     page_text = driver.find_element(By.XPATH, "/html/body").text.lower()
+    if "libgen" not in page_text:
+        return False, "no LibGen download link was exposed"
 
-    if 'libgen' in page_text:
+    links = driver.find_elements(
+        By.XPATH, "//a[contains(@href, 'libgen')]"
+    )
+    libgen_urls = [
+        link.get_attribute("href") for link in links
+        if link.get_attribute("href")
+    ]
+    if not libgen_urls:
+        return False, "LibGen link was not found"
+
+    for libgen_url in libgen_urls:
         try:
-            # Try multiple selectors for libgen link
-            libgen_link = None
-            
-            # Try different possible selectors
-            selectors = [
-                "//a[@class='js-download-link' and contains(@href, 'libgen') and text()='Libgen.li']",
-                "//a[contains(@href, 'libgen') and contains(@class, 'download')]",
-                "//a[contains(text(), 'Libgen') and contains(@href, 'libgen')]",
-                "//a[contains(@href, 'libgen')]"
-            ]
-            
-            for selector in selectors:
+            driver.get(libgen_url)
+            time.sleep(3)
+            download_selectors = (
+                "//a[contains(@href, 'get.php')]",
+                "//a[contains(text(), 'GET')]",
+                "//a[contains(@href, 'download')]",
+            )
+            for selector in download_selectors:
                 try:
-                    element = driver.find_element(By.XPATH, selector)
-                    libgen_link = element.get_attribute('href')
-                    break
+                    driver.find_element(By.XPATH, selector).click()
+                    dl_time = dlwait(download_path)
+                    print(f"Successfully downloaded ({dl_time} seconds)")
+                    return True, ""
                 except NoSuchElementException:
                     continue
-            
-            if not libgen_link:
-                print("Could not find libgen download link")
-                raise NoSuchElementException("Libgen link not found")
+        except Exception:
+            continue
 
-            # Open download link on libgen
-            driver.get(libgen_link)
-            time.sleep(3)
-            
-            # Look for download link on libgen page
+    return False, "LibGen requires manual verification or its page changed"
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("path", metavar="path", type=str, default=DL_PATH,
+                        nargs="?", help="A path for the download")
+    parser.add_argument("--s", metavar="search", type=str, required=True,
+                        help="A search query for the download")
+    parser.add_argument("--n", metavar="quantity", type=int, default=5,
+                        help="Number of unique results (0 means all)")
+    parser.add_argument("--all", action="store_true",
+                        help="Download every unique result returned")
+    args = parser.parse_args()
+
+    os.makedirs(args.path, exist_ok=True)
+    driver = start_browser()
+    driver.command_executor.set_timeout(20)
+    driver.set_page_load_timeout(20)
+    driver.set_script_timeout(20)
+    driver.command_executor._commands["send_command"] = (
+        "POST", "/session/$sessionId/chromium/send_command"
+    )
+    driver.execute(
+        "send_command",
+        {"cmd": "Page.setDownloadBehavior",
+         "params": {"behavior": "allow", "downloadPath": args.path}},
+    )
+
+    try:
+        results = search_results(driver, args.s, args.n, args.all)
+        if not results:
+            print("No results found. Please check your search query.")
+            return
+
+        if args.all:
+            selections = range(len(results))
+        else:
             try:
-                driver.execute_script("document.querySelector('a[href*=\"get.php\"]').click();")
-            except:
-                # Try alternative selectors
-                download_selectors = [
-                    "//a[contains(@href, 'get.php')]",
-                    "//a[contains(text(), 'GET')]",
-                    "//a[contains(@href, 'download')]"
-                ]
-                
-                for selector in download_selectors:
-                    try:
-                        download_link = driver.find_element(By.XPATH, selector)
-                        download_link.click()
-                        break
-                    except NoSuchElementException:
-                        continue
+                selection = int(input("\nEnter desired download: ")) - 1
+            except ValueError:
+                print("Invalid selection")
+                return
+            if selection < 0 or selection >= len(results):
+                print("Invalid selection")
+                return
+            selections = [selection]
 
-            print(f"Downloading ...")
-
-            dl_time = dlwait(DL_PATH)
-
-            print(f'Successfully downloaded. ({dl_time} seconds)')
-            
-        except Exception as e:
-            print(f"Error with libgen download: {e}")
-            print("Falling back to manual link selection...")
-    
-    if 'libgen' not in page_text or 'Error with libgen download:' in str(locals()):
-        print("ERROR: libgen.li link not found or failed.")
-        print("The following links require human verification.")
-        time.sleep(2)
-
-        # Find all download links
-        try:
-            # Try to find download links in various formats
-            download_elements = driver.find_elements(By.CSS_SELECTOR, 'a.js-download-link')
-            
-            if not download_elements:
-                download_elements = driver.find_elements(By.CSS_SELECTOR, 'a[href*="download"]')
-            
-            if not download_elements:
-                download_elements = driver.find_elements(By.XPATH, "//a[contains(@href, 'http') and (contains(@href, 'libgen') or contains(@href, 'download') or contains(@href, 'mirror'))]")
-
-            # Iterate through the download options
-            for i, element in enumerate(download_elements, start=1):
+        failures = []
+        for selection in selections:
+            result = results[selection]
+            print(f"\n[{selection + 1}] Downloading: {result['title']}")
+            succeeded = False
+            errors = []
+            for source_url in result["urls"]:
                 try:
-                    link_text = element.text.strip()
-                    link_href = element.get_attribute('href')
-                    
-                    # Get parent element text for context
-                    parent_text = ""
-                    try:
-                        parent_text = element.find_element(By.XPATH, "..").text.strip()
-                    except:
-                        pass
+                    succeeded, error = download_from_source(
+                        driver, source_url, args.path
+                    )
+                    if succeeded:
+                        break
+                    errors.append(f"{source_url}: {error}")
+                except Exception as error:
+                    errors.append(f"{source_url}: {error}")
 
-                    # Print the extracted information
-                    print(f"\nOption {i}:")
-                    print(f"\tLink Text: {link_text}")
-                    print(f"\tLink Href: {link_href}")
-                    if parent_text and parent_text != link_text:
-                        print(f"\tContext: {parent_text}")
+            if not succeeded:
+                failures.append((selection + 1, result["title"], errors))
+                print("Download failed; continuing with the next result.")
 
-                except Exception as e:
-                    print(f"\nOption {i}: Error extracting link info - {e}")
-                    
-        except Exception as e:
-            print(f"Could not find download links: {e}")
+        if failures:
+            print("\nDownloads that failed:")
+            for number, title, errors in failures:
+                print(f"  [{number}] {title}")
+                for error in errors:
+                    print(f"    {error}")
+        elif args.all:
+            print("\nAll requested downloads completed successfully.")
+    except KeyboardInterrupt:
+        print("\nScript interrupted by user")
+    finally:
+        driver.quit()
 
-except KeyboardInterrupt:
-    print("\nScript interrupted by user")
-except Exception as e:
-    print(f"An error occurred: {e}")
-finally:
-    driver.quit()
+if __name__ == "__main__":
+    main()
