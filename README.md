@@ -45,6 +45,7 @@ Options:
 - `--s QUERY` — required search query.
 - `--n NUMBER` — maximum number of unique results; `0` means all results.
 - `--all` — attempt to download every unique result, continuing after failures.
+- `--format FORMAT` — restrict downloads to a format such as `pdf`, `mobi`, or `epub`; repeat this option or use comma-separated values.
 - `path` — optional download directory; defaults to `download_path` in `config.json`, then `./assets/`.
 
 Use `--all` to attempt downloading every result returned by the search. If a
@@ -54,6 +55,22 @@ of failures at the end.
 The tool automatically tries Google Chrome first and Chromium second. It
 checks PATH and common Windows installation directories, so no browser choice
 is required on the command line.
+
+For example, download only PDFs:
+
+```bash
+python3 annadl ./books --s "Douglas Adams" --all --format pdf
+```
+
+Or allow PDFs and MOBI files:
+
+```bash
+python3 annadl ./books --s "Douglas Adams" --all --format pdf --format mobi
+```
+
+The format filter uses the file type shown in the mirror link or its nearby
+metadata. If a mirror does not expose that information, the result is
+reported as unavailable rather than selecting an unknown format.
 
 Search sources are configured in `config.json`. Each source should be a base
 URL; results with the same MD5 are grouped together and their source URLs are

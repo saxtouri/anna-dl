@@ -228,7 +228,40 @@ def click_external_downloads(driver):
             continue
 
 
-def download_from_source(driver, source_url, download_path):
+def normalize_formats(values):
+    formats = set()
+    for value in values or []:
+        for file_format in value.split(","):
+            file_format = file_format.strip().lower().lstrip(".")
+            if not file_format:
+                continue
+            if not re.fullmatch(r"[a-z0-9]+", file_format):
+                raise ValueError(f"invalid download format: {file_format}")
+            formats.add(file_format)
+    return formats
+
+
+def link_matches_formats(element, formats):
+    if not formats:
+        return True
+
+    context = " ".join(
+        (
+            element.text,
+            element.get_attribute("href") or "",
+            element.find_element(By.XPATH, "..").text,
+        )
+    ).lower()
+    return any(
+        re.search(rf"(?<![a-z0-9])\.{re.escape(file_format)}(?![a-z0-9])",
+                  context)
+        or re.search(rf"(?<![a-z0-9]){re.escape(file_format)}(?![a-z0-9])",
+                     context)
+        for file_format in formats
+    )
+
+
+def download_from_source(driver, source_url, download_path, formats):
     driver.get(source_url)
     time.sleep(2)
     click_external_downloads(driver)
@@ -257,17 +290,36 @@ def download_from_source(driver, source_url, download_path):
                 "//a[contains(text(), 'GET')]",
                 "//a[contains(@href, 'download')]",
             )
+            candidates = []
+            seen_links = set()
             for selector in download_selectors:
+                for element in driver.find_elements(By.XPATH, selector):
+                    link_key = (element.get_attribute("href"), element.text)
+                    if link_key not in seen_links:
+                        seen_links.add(link_key)
+                        candidates.append(element)
+
+            matching_candidates = [
+                element for element in candidates
+                if link_matches_formats(element, formats)
+            ]
+            if formats and not matching_candidates:
+                continue
+
+            for element in matching_candidates or candidates:
                 try:
-                    driver.find_element(By.XPATH, selector).click()
+                    element.click()
                     dl_time = dlwait(download_path)
                     print(f"Successfully downloaded ({dl_time} seconds)")
                     return True, ""
-                except NoSuchElementException:
+                except Exception:
                     continue
         except Exception:
             continue
 
+    if formats:
+        requested = ", ".join(sorted(formats))
+        return False, f"no matching download format found ({requested})"
     return False, "LibGen requires manual verification or its page changed"
 
 
@@ -281,7 +333,15 @@ def main():
                         help="Number of unique results (0 means all)")
     parser.add_argument("--all", action="store_true",
                         help="Download every unique result returned")
+    parser.add_argument("--format", action="append", dest="formats",
+                        metavar="FORMAT",
+                        help="Only download this format; repeat or comma-separate")
     args = parser.parse_args()
+
+    try:
+        formats = normalize_formats(args.formats)
+    except ValueError as error:
+        parser.error(str(error))
 
     os.makedirs(args.path, exist_ok=True)
     driver = start_browser()
@@ -325,7 +385,7 @@ def main():
             for source_url in result["urls"]:
                 try:
                     succeeded, error = download_from_source(
-                        driver, source_url, args.path
+                        driver, source_url, args.path, formats
                     )
                     if succeeded:
                         break
